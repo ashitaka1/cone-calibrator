@@ -1,0 +1,13 @@
+{
+  "module_name": "cone-calibrator",
+  "visibility": "public",
+  "namespace": "viamdemo",
+  "language": "go",
+  "resource_type": "service",
+  "resource_subtype": "generic",
+  "model_name": "cone-calibrator",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-03-08T07:06:28.995777Z",
+  "module_readme_link": "README.md"
+}
