@@ -19,13 +19,14 @@ Anyone calibrating a wrist-mounted camera on a robotic arm. Run once per hardwar
 ## How It Works
 
 1. The user manually positions the arm so it faces the apriltag sheet dead-on.
-2. The module reads the arm's current pose — this defines the aim axis.
-3. Given the distance to the sheet, circle radius, and number of positions, it computes N poses on the surface of a cone:
-   - The cone's apex is at the arm's current position
-   - The cone's axis is the line from the arm to the center of the sheet
-   - Each computed pose keeps the camera aimed at the center point
-4. The module moves the arm to each pose using the motion service.
-5. At each position, it calls `saveCalibrationPosition` on the frame-calibration service.
+2. The module reads the arm's current joint positions — this defines the starting state.
+3. Given the distance to the sheet, circle radius, and number of positions, it computes N poses in the arm's end-effector frame:
+   - Z axis = arm's aim direction (toward the sheet)
+   - Target point = (0, 0, distance_mm) — the sheet center
+   - Circle positions = (radius*cos, radius*sin, 0) on the XY plane
+   - Orientation at each position = normalized vector from position to target
+4. **Phase 1 (Plan):** Plans all moves sequentially via `armplanning.PlanMotion`, feeding each plan's end joints as the next plan's start. This validates feasibility before any motion occurs.
+5. **Phase 2 (Execute):** Moves to each planned joint position via `arm.MoveToJointPositions`, calling `saveCalibrationPosition` at each stop.
 
 ## Module Identity
 
@@ -46,9 +47,9 @@ Anyone calibrating a wrist-mounted camera on a robotic arm. Run once per hardwar
 
 ## Dependencies
 
-- Arm component (to read current pose, move via motion)
-- Motion service (for planning moves)
-- Frame-calibration service (to call `saveCalibrationPosition`)
+- Arm component (to read joint positions, execute planned moves)
+- Frame system service (to build a FrameSystem for `armplanning.PlanMotion`)
+- Frame-calibration service (to call `saveCalibrationPosition` via DoCommand)
 
 ## DoCommand Interface
 
@@ -56,10 +57,11 @@ Anyone calibrating a wrist-mounted camera on a robotic arm. Run once per hardwar
 
 Runs the full cone-scan calibration sweep.
 
-1. Reads current arm pose (the aim point)
-2. Computes cone positions
-3. Moves to each position, calling `saveCalibrationPosition` at each stop
-4. Returns `{"status": "done", "positions_saved": N}`
+1. Computes cone positions in the arm's end-effector frame
+2. Plans all moves via `armplanning.PlanMotion` (validates feasibility)
+3. Executes each move via `arm.MoveToJointPositions`
+4. Calls `saveCalibrationPosition` at each stop
+5. Returns `{"status": "done", "positions_saved": N}`
 
 ### `check_tags`
 
@@ -67,31 +69,72 @@ Calls `checkTags` on the frame-calibration service at the current position. Retu
 
 ## Tech Stack
 
-- Go 1.21+
-- `go.viam.com/rdk` — Viam Go SDK
-- Standard library `math` package for cone geometry computation
+- Go 1.25+
+- `go.viam.com/rdk` v0.115.0 — Viam Go SDK
+- `github.com/golang/geo/r3` — 3D vector math
+- `go.viam.com/rdk/motionplan/armplanning` — motion planning
+- `go.viam.com/rdk/spatialmath` — pose and orientation types
+
+## Project Layout
+
+```
+cone-calibrator/
+  module.go          # resource registration, Config, DoCommand, constructor
+  cone.go            # geometry computation, sweep execution
+  cone_test.go       # unit tests
+  cmd/module/main.go # viam module entrypoint
+  cmd/cli/main.go    # standalone CLI entrypoint
+  Makefile
+  meta.json
+```
+
+## Technical Architecture
+
+### Two-Phase Sweep (Plan-Then-Execute)
+
+The sweep separates planning from execution for safety:
+1. All N moves are planned sequentially, each starting from the previous plan's end joints
+2. If any plan fails, no motion has occurred — the arm stays in place
+3. Only after all plans succeed does execution begin
+
+### Frame System Construction
+
+`buildFrameSystem` fetches the full frame system config from the framesystem service, filters to only the arm's parts, and constructs a minimal FrameSystem. This is passed to `armplanning.PlanMotion`.
+
+### Dependency Resolution
+
+Uses typed `From` helpers in the constructor:
+- `arm.FromProvider(deps, name)` for the arm
+- `framesystem.FromDependencies(deps)` for the frame system service
+- `resource.FromDependencies[resource.Resource](deps, name)` for the calibration service (generic)
 
 ## Math
 
-The cone positions are computed as follows:
-- Let **C** be the current end-effector position
-- Let **A** be the aim axis (unit vector from C toward the sheet)
-- The center of the circle on the sheet is **C + distance * A**
-- Compute an orthonormal basis (U, V) perpendicular to A
-- For each position i of N: angle = 2 * pi * i / N
-  - Point on circle: **P_i = center + radius * (cos(angle) * U + sin(angle) * V)**
-  - Arm pose: position orbits on a matching circle, orientation always points back at sheet center
-
-The exact geometry needs careful implementation — the arm position moves on a circle at roughly constant distance from the sheet, and the orientation vector at each position always points to the sheet center.
+Poses are computed in the arm's end-effector frame:
+- Z axis = arm's aim direction (toward sheet)
+- Target = (0, 0, distance_mm) — the sheet center
+- For each position i of N: angle = 2*pi*i/N
+  - Position = (radius*cos(angle), radius*sin(angle), 0)
+  - Orientation = normalized vector from position to target
+- Position 0 is the identity pose (arm stays where it is)
 
 ## Build & Deploy
 
-- `go build` produces a single static binary — no runtime dependencies on target
-- `meta.json` entrypoint points to the binary
-- Deploy with `viam module reload-local`
+- `make` builds to `bin/cone-calibrator`
+- `make module.tar.gz` builds the deployable tarball
+- Target architectures: linux/amd64, linux/arm64, darwin/arm64, windows/amd64
+- `meta.json` entrypoint: `bin/cone-calibrator`
 
 ## Viam SDK Patterns (Go)
 
 - Dependencies come from config, resolved in `Reconfigure` via the `Dependencies` map
-- Use `resource.FromProvider` to look up typed resources
+- Use typed `From` helpers (`arm.FromProvider`, `framesystem.FromDependencies`, `resource.FromDependencies[T]`)
 - `do_command` on the frame-calibration service is how you call `saveCalibrationPosition` and `checkTags`
+- `Config.Validate` returns `(deps []string, attrs []string, error)` — 3-return form
+
+## Milestones
+
+- [x] Module scaffold
+- [x] Cone geometry computation
+- [x] Two-phase sweep (plan-then-execute)
+- [ ] Hardware validation

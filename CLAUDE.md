@@ -22,38 +22,44 @@ cone-calibrator/
   project_spec.md
   CLAUDE.md
   meta.json
+  Makefile
   go.mod
   go.sum
-  main.go
-  cone_calibrator.go
+  module.go          # resource registration, Config, DoCommand, constructor
+  cone.go            # geometry computation, sweep execution
+  cone_test.go
+  cmd/module/main.go # viam module entrypoint
+  cmd/cli/main.go    # standalone CLI entrypoint
 ```
 
 ## Key Conventions
 
 - Go module, single binary output — no runtime dependencies on target
 - Dependencies come from config attributes, resolved in `Reconfigure` via `Dependencies` map
-- Use `resource.FromProvider`, never direct robot lookups
-- Geometry math uses standard library `math`
+- Use typed `From` helpers (`arm.FromProvider`, `framesystem.FromDependencies`, `resource.FromDependencies[T]`)
+- Geometry math uses `math` and `github.com/golang/geo/r3`; poses via `go.viam.com/rdk/spatialmath`
+- Motion planning uses `armplanning.PlanMotion` (plan-then-execute pattern)
+- `Config.Validate` returns `(deps []string, attrs []string, error)` — 3-return form
 
 ## Development
 
 ```bash
-go build -o cone-calibrator .
-viam module reload-local --part-id <PART_ID> \
-    --model-name viamdemo:cone-calibrator:cone-calibrator \
-    --resource-name cone-calibrator
+make                 # build to bin/cone-calibrator
+make test            # go test ./...
+make lint            # gofmt -s -w .
+make module          # test + build tarball (module.tar.gz)
 ```
 
 ## Dependencies on Other Services
 
 - **Arm:** To read current pose and as a motion target
-- **Motion service (builtin):** For planning arm moves
+- **Frame system service:** To build a FrameSystem for `armplanning.PlanMotion`
 - **Frame-calibration service:** To call `saveCalibrationPosition` and `checkTags` via `do_command`
 
 ## The Math
 
-Compute N positions on a cone surface:
-- Aim axis = current arm orientation (pointing at tag sheet)
-- Circle of given radius at given distance along the aim axis
-- At each position, arm orientation points back at sheet center
-- Uses orthonormal basis perpendicular to aim axis
+Compute N poses in the arm's end-effector frame:
+- Z axis = arm's aim direction (toward sheet), target = (0, 0, distance)
+- Circle of given radius on the XY plane at Z=0
+- At each position, orientation = normalized vector from position to target
+- Two-phase execution: plan all moves via `armplanning.PlanMotion`, then execute sequentially
