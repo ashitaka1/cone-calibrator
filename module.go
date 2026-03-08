@@ -6,9 +6,10 @@ import (
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
+	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/robot/framesystem"
 	"go.viam.com/rdk/services/generic"
-	"go.viam.com/rdk/services/motion"
 )
 
 var ConeCalibrator = resource.NewModel("viamdemo", "cone-calibrator", "cone-calibrator")
@@ -60,9 +61,10 @@ type coneCalibrator struct {
 	logger logging.Logger
 	cfg    *Config
 
-	arm       arm.Arm
-	motion    motion.Service
-	calSvc    resource.Resource
+	arm    arm.Arm
+	rfs    framesystem.Service
+	calSvc resource.Resource
+
 	cancelCtx context.Context
 	cancelFn  func()
 }
@@ -92,9 +94,9 @@ func NewConeCalibrator(
 		return nil, fmt.Errorf("arm %q: %w", conf.ArmName, err)
 	}
 
-	mot, err := motion.FromProvider(deps, "builtin")
+	rfs, err := framesystem.FromDependencies(deps)
 	if err != nil {
-		return nil, fmt.Errorf("motion service: %w", err)
+		return nil, fmt.Errorf("frame system: %w", err)
 	}
 
 	calSvc, err := resource.FromDependencies[resource.Resource](deps, generic.Named(conf.CalibrationService))
@@ -109,7 +111,7 @@ func NewConeCalibrator(
 		logger:    logger,
 		cfg:       conf,
 		arm:       a,
-		motion:    mot,
+		rfs:       rfs,
 		calSvc:    calSvc,
 		cancelCtx: cancelCtx,
 		cancelFn:  cancelFn,
@@ -133,4 +135,27 @@ func (s *coneCalibrator) DoCommand(ctx context.Context, cmd map[string]interface
 func (s *coneCalibrator) Close(context.Context) error {
 	s.cancelFn()
 	return nil
+}
+
+// buildFrameSystem constructs a FrameSystem containing just the arm,
+// suitable for armplanning.PlanMotion.
+func (s *coneCalibrator) buildFrameSystem(ctx context.Context) (*referenceframe.FrameSystem, error) {
+	fsCfg, err := s.rfs.FrameSystemConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting frame system config: %w", err)
+	}
+
+	// Filter to only include the arm's parts
+	var armParts []*referenceframe.FrameSystemPart
+	for _, part := range fsCfg.Parts {
+		if part.FrameConfig.Name() == s.cfg.ArmName {
+			armParts = append(armParts, part)
+		}
+	}
+
+	fs, err := referenceframe.NewFrameSystem("cone-calibrator", armParts, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building frame system: %w", err)
+	}
+	return fs, nil
 }

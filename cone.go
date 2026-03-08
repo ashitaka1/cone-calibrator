@@ -7,8 +7,8 @@ import (
 
 	"github.com/golang/geo/r3"
 
+	"go.viam.com/rdk/motionplan/armplanning"
 	"go.viam.com/rdk/referenceframe"
-	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/spatialmath"
 )
 
@@ -35,7 +35,6 @@ func computeConePositions(distanceMM, radiusMM float64, n int) []spatialmath.Pos
 
 		pos := r3.Vector{X: x, Y: y, Z: 0}
 
-		// Aim from this position toward the target point
 		dir := target.Sub(pos).Normalize()
 
 		orientation := &spatialmath.OrientationVector{
@@ -51,40 +50,85 @@ func computeConePositions(distanceMM, radiusMM float64, n int) []spatialmath.Pos
 }
 
 // runSweep executes the full cone-scan calibration sweep.
-// It computes target positions in the arm's frame, then moves through each
-// sequentially via the motion service, saving calibration data at every stop.
+//
+// It pre-computes all target poses, plans every move via armplanning.PlanMotion
+// (which validates feasibility without executing), then executes the planned
+// joint positions using arm.MoveThroughJointPositions. Calibration data is
+// saved at each stop.
 func (s *coneCalibrator) runSweep(ctx context.Context) (map[string]interface{}, error) {
 	poses := computeConePositions(s.cfg.DistanceMM, s.cfg.RadiusMM, s.cfg.NumPositions)
 	s.logger.Infof("computed %d sweep positions (including initial)", len(poses))
 
-	saved := 0
+	fs, err := s.buildFrameSystem(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-	// Save calibration at the initial dead-on position
+	startJoints, err := s.arm.JointPositions(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("reading arm joint positions: %w", err)
+	}
+
+	// Phase 1: plan all moves and collect joint positions.
+	// Each pose is in the arm's frame. We plan sequentially, feeding
+	// each plan's end joints as the next plan's start.
+	s.logger.Info("planning all moves...")
+	allJoints := [][]referenceframe.Input{startJoints}
+
+	for i := 1; i < len(poses); i++ {
+		goalPose := referenceframe.NewPoseInFrame(s.cfg.ArmName, poses[i])
+
+		req := &armplanning.PlanRequest{
+			FrameSystem: fs,
+			Goals: []*armplanning.PlanState{
+				armplanning.NewPlanState(
+					referenceframe.FrameSystemPoses{s.cfg.ArmName: goalPose},
+					nil,
+				),
+			},
+			StartState: armplanning.NewPlanState(nil, referenceframe.FrameSystemInputs{
+				s.cfg.ArmName: allJoints[len(allJoints)-1],
+			}),
+		}
+
+		plan, _, err := armplanning.PlanMotion(ctx, s.logger, req)
+		if err != nil {
+			return nil, fmt.Errorf("motion plan failed for position %d/%d: %w", i, len(poses)-1, err)
+		}
+
+		traj := plan.Trajectory()
+		if len(traj) < 2 {
+			return nil, fmt.Errorf("unexpected trajectory length %d for position %d", len(traj), i)
+		}
+		goalJoints := traj[len(traj)-1][s.cfg.ArmName]
+		allJoints = append(allJoints, goalJoints)
+
+		s.logger.Infof("planned position %d/%d", i, len(poses)-1)
+	}
+
+	s.logger.Infof("all %d moves planned successfully", len(poses)-1)
+
+	// Phase 2: execute moves and save calibration at each stop.
+	// Save at the initial position first.
 	s.logger.Info("saving calibration at initial position")
 	if err := s.saveCalibrationPosition(ctx); err != nil {
 		return nil, fmt.Errorf("saving calibration at initial position: %w", err)
 	}
-	saved++
+	saved := 1
 
-	// Move to each computed position and save calibration data.
-	// Poses are in the arm's frame — the motion service handles the transform.
-	for i := 1; i < len(poses); i++ {
-		s.logger.Infof("moving to position %d/%d", i, len(poses)-1)
+	for i := 1; i < len(allJoints); i++ {
+		s.logger.Infof("moving to position %d/%d", i, len(allJoints)-1)
 
-		dest := referenceframe.NewPoseInFrame(s.cfg.ArmName, poses[i])
-		_, err := s.motion.Move(ctx, motion.MoveReq{
-			ComponentName: s.cfg.ArmName,
-			Destination:   dest,
-		})
+		err := s.arm.MoveToJointPositions(ctx, allJoints[i], nil)
 		if err != nil {
-			return nil, fmt.Errorf("move to position %d failed (saved %d so far): %w", i, saved, err)
+			return nil, fmt.Errorf("move to position %d failed: %w", i, err)
 		}
 
 		if err := s.saveCalibrationPosition(ctx); err != nil {
 			return nil, fmt.Errorf("saving calibration at position %d: %w", i, err)
 		}
 		saved++
-		s.logger.Infof("saved position %d/%d", i, len(poses)-1)
+		s.logger.Infof("saved position %d/%d", i, len(allJoints)-1)
 	}
 
 	s.logger.Infof("sweep complete: %d positions saved", saved)
