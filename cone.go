@@ -12,57 +12,36 @@ import (
 	"go.viam.com/rdk/spatialmath"
 )
 
-// computeConePositions computes N poses arranged in a circle on a plane parallel to
-// the calibration sheet, plus the initial dead-on pose. The arm's orientation at each
-// position aims back at the sheet center.
+// computeConePositions computes N poses in the arm's end-effector frame arranged
+// in a circle on the XY plane, plus a zero pose for the initial position.
 //
-// Geometry:
-//   - P = current end-effector position
-//   - A = aim axis (unit vector from the current orientation)
-//   - Sheet center C = P + distance*A
-//   - U, V = orthonormal basis perpendicular to A
-//   - Position i: P + radius*(cos(angle)*U + sin(angle)*V)
-//   - Orientation at each position: aim from that position toward C
-func computeConePositions(currentPose spatialmath.Pose, distanceMM, radiusMM float64, n int) []spatialmath.Pose {
-	p := currentPose.Point()
-	ov := currentPose.Orientation().OrientationVectorRadians()
-	aimAxis := r3.Vector{X: ov.OX, Y: ov.OY, Z: ov.OZ}.Normalize()
-
-	sheetCenter := r3.Vector{
-		X: p.X + distanceMM*aimAxis.X,
-		Y: p.Y + distanceMM*aimAxis.Y,
-		Z: p.Z + distanceMM*aimAxis.Z,
-	}
-
-	u, v := orthonormalBasis(aimAxis)
-
+// In the arm's frame:
+//   - Z axis = the arm's aim direction (toward the sheet)
+//   - Target point = (0, 0, distance_mm) — the sheet center
+//   - Circle positions = (radius*cos, radius*sin, 0) on the XY plane
+//   - Orientation at each position = normalized vector from position to target
+func computeConePositions(distanceMM, radiusMM float64, n int) []spatialmath.Pose {
 	poses := make([]spatialmath.Pose, 0, n+1)
 
-	// Position 0: the initial dead-on pose (unchanged)
-	poses = append(poses, currentPose)
+	// Position 0: identity pose (the arm stays where it is)
+	poses = append(poses, spatialmath.NewZeroPose())
 
-	// Positions 1..N: circle around the aim axis
+	target := r3.Vector{X: 0, Y: 0, Z: distanceMM}
+
 	for i := range n {
 		angle := 2 * math.Pi * float64(i) / float64(n)
-		cos, sin := math.Cos(angle), math.Sin(angle)
+		x := radiusMM * math.Cos(angle)
+		y := radiusMM * math.Sin(angle)
 
-		pos := r3.Vector{
-			X: p.X + radiusMM*(cos*u.X+sin*v.X),
-			Y: p.Y + radiusMM*(cos*u.Y+sin*v.Y),
-			Z: p.Z + radiusMM*(cos*u.Z+sin*v.Z),
-		}
+		pos := r3.Vector{X: x, Y: y, Z: 0}
 
-		dir := r3.Vector{
-			X: sheetCenter.X - pos.X,
-			Y: sheetCenter.Y - pos.Y,
-			Z: sheetCenter.Z - pos.Z,
-		}.Normalize()
+		// Aim from this position toward the target point
+		dir := target.Sub(pos).Normalize()
 
 		orientation := &spatialmath.OrientationVector{
-			Theta: ov.Theta,
-			OX:    dir.X,
-			OY:    dir.Y,
-			OZ:    dir.Z,
+			OX: dir.X,
+			OY: dir.Y,
+			OZ: dir.Z,
 		}
 
 		poses = append(poses, spatialmath.NewPose(pos, orientation))
@@ -71,46 +50,28 @@ func computeConePositions(currentPose spatialmath.Pose, distanceMM, radiusMM flo
 	return poses
 }
 
-// orthonormalBasis returns two unit vectors U, V perpendicular to the given axis,
-// forming a right-handed coordinate system (U, V, axis).
-func orthonormalBasis(axis r3.Vector) (r3.Vector, r3.Vector) {
-	// Pick a vector not parallel to axis to seed the cross product
-	seed := r3.Vector{X: 1, Y: 0, Z: 0}
-	if math.Abs(axis.X) > 0.9 {
-		seed = r3.Vector{X: 0, Y: 1, Z: 0}
-	}
-
-	u := axis.Cross(seed).Normalize()
-	v := axis.Cross(u).Normalize()
-	return u, v
-}
-
 // runSweep executes the full cone-scan calibration sweep.
-// It computes all target positions, then moves through each sequentially,
-// saving calibration data at every stop.
+// It computes target positions in the arm's frame, then moves through each
+// sequentially via the motion service, saving calibration data at every stop.
 func (s *coneCalibrator) runSweep(ctx context.Context) (map[string]interface{}, error) {
-	currentPose, err := s.arm.EndPosition(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("reading arm position: %w", err)
-	}
-
-	poses := computeConePositions(currentPose, s.cfg.DistanceMM, s.cfg.RadiusMM, s.cfg.NumPositions)
+	poses := computeConePositions(s.cfg.DistanceMM, s.cfg.RadiusMM, s.cfg.NumPositions)
 	s.logger.Infof("computed %d sweep positions (including initial)", len(poses))
 
 	saved := 0
 
-	// Save calibration at the initial dead-on position (position 0)
+	// Save calibration at the initial dead-on position
 	s.logger.Info("saving calibration at initial position")
 	if err := s.saveCalibrationPosition(ctx); err != nil {
 		return nil, fmt.Errorf("saving calibration at initial position: %w", err)
 	}
 	saved++
 
-	// Move to each computed position and save calibration data
+	// Move to each computed position and save calibration data.
+	// Poses are in the arm's frame — the motion service handles the transform.
 	for i := 1; i < len(poses); i++ {
 		s.logger.Infof("moving to position %d/%d", i, len(poses)-1)
 
-		dest := referenceframe.NewPoseInFrame("world", poses[i])
+		dest := referenceframe.NewPoseInFrame(s.cfg.ArmName, poses[i])
 		_, err := s.motion.Move(ctx, motion.MoveReq{
 			ComponentName: s.cfg.ArmName,
 			Destination:   dest,
