@@ -3,6 +3,7 @@ package conecalibrator
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/logging"
@@ -23,11 +24,12 @@ func init() {
 }
 
 type Config struct {
-	ArmName            string  `json:"arm_name"`
-	CalibrationService string  `json:"calibration_service"`
-	DistanceMM         float64 `json:"distance_mm"`
-	RadiusMM           float64 `json:"radius_mm"`
-	NumPositions       int     `json:"num_positions"`
+	ArmName            string      `json:"arm_name"`
+	CalibrationService string      `json:"calibration_service"`
+	DistanceMM         float64     `json:"distance_mm"`
+	RadiusMM           float64     `json:"radius_mm"`
+	NumPositions       int         `json:"num_positions"`
+	PlannedPositions   [][]float64 `json:"planned_positions,omitempty"`
 }
 
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
@@ -64,6 +66,10 @@ type coneCalibrator struct {
 	arm    arm.Arm
 	rfs    framesystem.Service
 	calSvc resource.Resource
+
+	mu       sync.Mutex
+	planning bool
+	planErr  error
 
 	cancelCtx context.Context
 	cancelFn  func()
@@ -129,7 +135,33 @@ func (s *coneCalibrator) DoCommand(ctx context.Context, cmd map[string]interface
 	if _, ok := cmd["check_tags"]; ok {
 		return s.checkTags(ctx)
 	}
-	return nil, fmt.Errorf("unknown command, expected run_sweep or check_tags")
+	if _, ok := cmd["plan_joints"]; ok {
+		return s.handlePlanJoints(ctx)
+	}
+	if _, ok := cmd["planning_status"]; ok {
+		return s.planningStatus()
+	}
+	return nil, fmt.Errorf("unknown command, expected run_sweep, check_tags, plan_joints, or planning_status")
+}
+
+func (s *coneCalibrator) planningStatus() (map[string]interface{}, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.planning {
+		return map[string]interface{}{"status": "planning"}, nil
+	}
+	if s.planErr != nil {
+		return map[string]interface{}{"status": "error", "error": s.planErr.Error()}, nil
+	}
+	if len(s.cfg.PlannedPositions) > 0 {
+		return map[string]interface{}{
+			"status":           "done",
+			"joint_positions":  s.cfg.PlannedPositions,
+			"num_positions":    len(s.cfg.PlannedPositions),
+		}, nil
+	}
+	return map[string]interface{}{"status": "idle"}, nil
 }
 
 func (s *coneCalibrator) Close(context.Context) error {
@@ -137,23 +169,16 @@ func (s *coneCalibrator) Close(context.Context) error {
 	return nil
 }
 
-// buildFrameSystem constructs a FrameSystem containing just the arm,
-// suitable for armplanning.PlanMotion.
+// buildFrameSystem constructs a FrameSystem from the robot's full frame config.
+// The arm's frame config may reference a static offset frame (its parent),
+// so we include all parts to ensure the tree resolves correctly.
 func (s *coneCalibrator) buildFrameSystem(ctx context.Context) (*referenceframe.FrameSystem, error) {
 	fsCfg, err := s.rfs.FrameSystemConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting frame system config: %w", err)
 	}
 
-	// Filter to only include the arm's parts
-	var armParts []*referenceframe.FrameSystemPart
-	for _, part := range fsCfg.Parts {
-		if part.FrameConfig.Name() == s.cfg.ArmName {
-			armParts = append(armParts, part)
-		}
-	}
-
-	fs, err := referenceframe.NewFrameSystem("cone-calibrator", armParts, nil)
+	fs, err := referenceframe.NewFrameSystem("cone-calibrator", fsCfg.Parts, nil)
 	if err != nil {
 		return nil, fmt.Errorf("building frame system: %w", err)
 	}

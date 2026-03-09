@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/erh/vmodutils"
 	"github.com/golang/geo/r3"
 
 	"go.viam.com/rdk/motionplan/armplanning"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/spatialmath"
+	"go.viam.com/rdk/utils"
 )
 
 // computeConePositions computes N poses in the arm's end-effector frame arranged
@@ -49,13 +51,9 @@ func computeConePositions(distanceMM, radiusMM float64, n int) []spatialmath.Pos
 	return poses
 }
 
-// runSweep executes the full cone-scan calibration sweep.
-//
-// It pre-computes all target poses, plans every move via armplanning.PlanMotion
-// (which validates feasibility without executing), then executes the planned
-// joint positions using arm.MoveThroughJointPositions. Calibration data is
-// saved at each stop.
-func (s *coneCalibrator) runSweep(ctx context.Context) (map[string]interface{}, error) {
+// planJoints plans all cone positions and returns the joint values (radians)
+// for each stop. Does not move the arm.
+func (s *coneCalibrator) planJoints(ctx context.Context) ([][]referenceframe.Input, error) {
 	poses := computeConePositions(s.cfg.DistanceMM, s.cfg.RadiusMM, s.cfg.NumPositions)
 	s.logger.Infof("computed %d sweep positions (including initial)", len(poses))
 
@@ -69,9 +67,6 @@ func (s *coneCalibrator) runSweep(ctx context.Context) (map[string]interface{}, 
 		return nil, fmt.Errorf("reading arm joint positions: %w", err)
 	}
 
-	// Phase 1: plan all moves and collect joint positions.
-	// Each pose is in the arm's frame. We plan sequentially, feeding
-	// each plan's end joints as the next plan's start.
 	s.logger.Info("planning all moves...")
 	allJoints := [][]referenceframe.Input{startJoints}
 
@@ -107,9 +102,29 @@ func (s *coneCalibrator) runSweep(ctx context.Context) (map[string]interface{}, 
 	}
 
 	s.logger.Infof("all %d moves planned successfully", len(poses)-1)
+	return allJoints, nil
+}
 
-	// Phase 2: execute moves and save calibration at each stop.
-	// Save at the initial position first.
+// inputsToFloats converts [][]referenceframe.Input to [][]float64.
+// In this RDK version, Input is a float64 alias, so this is a shallow copy.
+func inputsToFloats(allJoints [][]referenceframe.Input) [][]float64 {
+	result := make([][]float64, len(allJoints))
+	for i, joints := range allJoints {
+		vals := make([]float64, len(joints))
+		copy(vals, joints)
+		result[i] = vals
+	}
+	return result
+}
+
+// runSweep executes the full cone-scan calibration sweep.
+func (s *coneCalibrator) runSweep(ctx context.Context) (map[string]interface{}, error) {
+	allJoints, err := s.planJoints(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Execute moves and save calibration at each stop.
 	s.logger.Info("saving calibration at initial position")
 	if err := s.saveCalibrationPosition(ctx); err != nil {
 		return nil, fmt.Errorf("saving calibration at initial position: %w", err)
@@ -136,6 +151,56 @@ func (s *coneCalibrator) runSweep(ctx context.Context) (map[string]interface{}, 
 		"status":          "done",
 		"positions_saved": saved,
 	}, nil
+}
+
+func (s *coneCalibrator) handlePlanJoints(_ context.Context) (map[string]interface{}, error) {
+	s.mu.Lock()
+	if s.planning {
+		s.mu.Unlock()
+		return map[string]interface{}{"status": "already_planning"}, nil
+	}
+	s.planning = true
+	s.planErr = nil
+	s.mu.Unlock()
+
+	go func() {
+		err := s.planAndSave()
+
+		s.mu.Lock()
+		s.planning = false
+		s.planErr = err
+		s.mu.Unlock()
+
+		if err != nil {
+			s.logger.Errorf("plan_joints failed: %v", err)
+		} else {
+			s.logger.Info("plan_joints complete, config updated")
+		}
+	}()
+
+	return map[string]interface{}{"status": "planning_started"}, nil
+}
+
+func (s *coneCalibrator) planAndSave() error {
+	allJoints, err := s.planJoints(s.cancelCtx)
+	if err != nil {
+		return err
+	}
+
+	positions := inputsToFloats(allJoints)
+
+	newAttr := utils.AttributeMap{
+		"arm_name":            s.cfg.ArmName,
+		"calibration_service": s.cfg.CalibrationService,
+		"distance_mm":         s.cfg.DistanceMM,
+		"radius_mm":           s.cfg.RadiusMM,
+		"num_positions":       s.cfg.NumPositions,
+		"planned_positions":   positions,
+	}
+
+	return vmodutils.UpdateComponentCloudAttributesFromModuleEnv(
+		s.cancelCtx, s.name, newAttr, s.logger,
+	)
 }
 
 func (s *coneCalibrator) saveCalibrationPosition(ctx context.Context) error {
